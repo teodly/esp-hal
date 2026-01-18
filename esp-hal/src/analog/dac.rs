@@ -47,26 +47,52 @@ use crate::gpio::AnalogPin;
 
 #[cfg(esp32s2)]
 pub mod continuous_dma {
-    //! ESP32-S2 DAC continuous output backed by SPI3 DMA (no_std, esp-hal).
+    //! # Digital to Analog Converter (DAC) Continuous DMA (ESP32-S2)
     //!
-    //! ## Hardware notes (ESP32-S2)
-    //! - The DAC “continuous” engine is driven by the APB_SARADC digital controller.
-    //! - The data source for DAC DMA is SPI3 DMA TX (no SPI pins involved).
-    //! - The DAC digital controller shares clocking/dividers with the ADC digital controller. This
-    //!   is typically compatible with ADC *oneshot* reads, but may interfere with ADC
-    //!   digital/continuous modes.
+    //! ## Overview
+    //! Continuous 8-bit DAC output using the APB_SARADC digital controller with SPI3 DMA as the
+    //! data source (no SPI pins involved).
     //!
-    //! ## Current API surface
-    //! This module intentionally mirrors the I2S TX DMA ergonomics:
-    //! - you start a circular DMA transfer with `write_dma_circular()`
-    //! - then you refill the ring buffer using the returned `DmaTransferTxCircular` handle
-    //!   (`available()`, `push_with()`, etc).
+    //! ## Configuration
+    //! The output rate is set via [`Config`]. The DAC digital controller clock/dividers are derived
+    //! from the APB clock. DAC1 is hard-wired to GPIO17 on ESP32-S2, so pin selection is not
+    //! applicable.
     //!
-    //! This is designed for mono output. SPI3 is assumed dedicated to DAC DMA.
+    //! ## Usage
+    //! Start a circular transfer with [`DacContinuousTx::write_dma_circular`] and refill the ring
+    //! buffer using the returned transfer handle.
+    //!
+    //! ## Examples
+    //! ### Start circular DAC DMA
+    //! ```rust, no_run
+    //! # {before_snippet}
+    //! use esp_hal::analog::dac::continuous_dma::{Config, DacContinuousTx};
+    //! # let dma = peripherals.DMA_SPI3;
+    //! # let ((), (), mut tx_buf, tx_desc) = esp_hal::dma_buffers!(0, 1024);
+    //! let mut dac = DacContinuousTx::new(
+    //!     peripherals.DAC1,
+    //!     peripherals.GPIO17,
+    //!     peripherals.SPI3,
+    //!     dma,
+    //!     Config::new(384_000),
+    //!     tx_desc,
+    //! )?;
+    //! let _transfer = dac.write_dma_circular(&mut tx_buf)?;
+    //! # Ok(())
+    //! # }
+    //! ```
+    //!
+    //! ## Implementation State
+    //! - Mono output only (DAC1 / GPIO17).
+    //! - SPI3 is reserved exclusively for DAC DMA.
+    //! - ADC oneshot remains compatible; ADC digital/continuous modes may conflict.
+
+    use core::mem::ManuallyDrop;
 
     use enumset::EnumSet;
 
     use crate::{
+        Async,
         Blocking,
         DriverMode,
         analog::dac::Dac,
@@ -93,13 +119,24 @@ pub mod continuous_dma {
     };
 
     /// Errors returned by the DAC continuous DMA driver.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    #[non_exhaustive]
+    #[instability::unstable]
     pub enum Error {
-        /// The requested frequency cannot be represented with the available dividers.
-        UnsupportedFrequency,
         /// DMA configuration or runtime error.
         Dma(DmaError),
     }
+
+    impl core::fmt::Display for Error {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Error::Dma(err) => write!(f, "DMA error: {err:?}"),
+            }
+        }
+    }
+
+    impl core::error::Error for Error {}
 
     impl From<DmaError> for Error {
         fn from(e: DmaError) -> Self {
@@ -107,30 +144,57 @@ pub mod continuous_dma {
         }
     }
 
+    /// Configuration errors for DAC continuous output.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    #[non_exhaustive]
+    #[instability::unstable]
+    pub enum ConfigError {
+        /// The requested frequency cannot be represented with the available dividers.
+        UnsupportedFrequency,
+    }
+
+    impl core::fmt::Display for ConfigError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                ConfigError::UnsupportedFrequency => write!(f, "unsupported frequency"),
+            }
+        }
+    }
+
+    impl core::error::Error for ConfigError {}
+
     /// Configuration for DAC continuous output.
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, procmacros::BuilderLite)]
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    #[non_exhaustive]
+    #[instability::unstable]
     pub struct Config {
         /// DAC conversion frequency in Hz (bytes/s for mono).
-        pub freq_hz: u32,
+        freq_hz: u32,
         /// Whether to invert the DAC digital controller clock.
-        pub invert_clock: bool,
+        invert_clock: bool,
+    }
+
+    impl Default for Config {
+        fn default() -> Self {
+            Self {
+                freq_hz: 48_000,
+                invert_clock: true,
+            }
+        }
     }
 
     impl Config {
         /// Create a new configuration for mono continuous DAC output.
         ///
         /// `freq_hz` is the DAC conversion frequency (i.e. bytes/s for mono).
+        #[instability::unstable]
         pub const fn new(freq_hz: u32) -> Self {
             Self {
                 freq_hz,
                 invert_clock: true, // matches IDF default behavior for ESP32-S2
             }
-        }
-
-        /// Configure whether to invert the DAC digital controller clock.
-        pub const fn with_invert_clock(mut self, invert: bool) -> Self {
-            self.invert_clock = invert;
-            self
         }
     }
 
@@ -146,7 +210,8 @@ pub mod continuous_dma {
         if a > b { a - b } else { b - a }
     }
 
-    // Port of `hal_utils_calc_clk_div_frac_accurate()` (IDF) for no_std usage.
+    // Port of `hal_utils_calc_clk_div_frac_accurate()` from ESP-IDF.
+    // Source: https://github.com/espressif/esp-idf/blob/b9a308a47ca4128d018495662b009a7c461b6780/components/hal/hal_utils.c#L69-L118
     fn calc_clk_div_frac_accurate(
         src_freq_hz: u32,
         exp_freq_hz: u32,
@@ -206,6 +271,7 @@ pub mod continuous_dma {
     }
 
     /// DAC continuous output driver (mono, DAC1 / GPIO17) using SPI3 DMA TX.
+    #[instability::unstable]
     pub struct DacContinuousTx<'d, Dm>
     where
         Dm: DriverMode,
@@ -218,12 +284,34 @@ pub mod continuous_dma {
         cfg: Config,
     }
 
+    impl<Dm> core::fmt::Debug for DacContinuousTx<'_, Dm>
+    where
+        Dm: DriverMode,
+    {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("DacContinuousTx").finish()
+        }
+    }
+
+    #[cfg(feature = "defmt")]
+    impl<Dm> defmt::Format for DacContinuousTx<'_, Dm>
+    where
+        Dm: DriverMode,
+    {
+        fn format(&self, fmt: defmt::Formatter<'_>) {
+            defmt::write!(fmt, "DacContinuousTx");
+        }
+    }
+
     impl<'d> DacContinuousTx<'d, Blocking> {
         /// Create a mono continuous DAC output on DAC1 (GPIO17), backed by SPI3 DMA.
+        ///
+        /// DAC1 is hard-wired to GPIO17 on ESP32-S2, so there is no pin selection.
         ///
         /// - `spi3` is consumed and reserved for DAC DMA usage.
         /// - `dma` must be `DMA_SPI3`.
         /// - `descriptors` are the DMA descriptors for circular transfers.
+        #[instability::unstable]
         pub fn new(
             dac1: DAC1<'d>,
             dac1_pin: GPIO17<'d>,
@@ -231,7 +319,7 @@ pub mod continuous_dma {
             dma: impl DmaChannelFor<SPI3<'d>>,
             cfg: Config,
             descriptors: &'static mut [DmaDescriptor],
-        ) -> Result<Self, Error> {
+        ) -> Result<Self, ConfigError> {
             let _dac = Dac::new(dac1, dac1_pin);
 
             // Ensure DAC is in "pad source" mode (disable CW generator path for this channel).
@@ -260,6 +348,38 @@ pub mod continuous_dma {
 
             this.configure_clock_and_enable_dma(cfg.freq_hz, false)?;
             Ok(this)
+        }
+
+        /// Converts this driver into async mode.
+        #[instability::unstable]
+        pub fn into_async(self) -> DacContinuousTx<'d, Async> {
+            let mut this = ManuallyDrop::new(self);
+            let tx_channel = unsafe { core::ptr::read(&mut this.tx_channel) }.into_async();
+            DacContinuousTx {
+                _dac: unsafe { core::ptr::read(&mut this._dac) },
+                _spi3_guard: unsafe { core::ptr::read(&mut this._spi3_guard) },
+                _spi3: unsafe { core::ptr::read(&mut this._spi3) },
+                tx_channel,
+                tx_chain: unsafe { core::ptr::read(&mut this.tx_chain) },
+                cfg: unsafe { core::ptr::read(&mut this.cfg) },
+            }
+        }
+    }
+
+    impl<'d> DacContinuousTx<'d, Async> {
+        /// Converts this driver into blocking mode.
+        #[instability::unstable]
+        pub fn into_blocking(self) -> DacContinuousTx<'d, Blocking> {
+            let mut this = ManuallyDrop::new(self);
+            let tx_channel = unsafe { core::ptr::read(&mut this.tx_channel) }.into_blocking();
+            DacContinuousTx {
+                _dac: unsafe { core::ptr::read(&mut this._dac) },
+                _spi3_guard: unsafe { core::ptr::read(&mut this._spi3_guard) },
+                _spi3: unsafe { core::ptr::read(&mut this._spi3) },
+                tx_channel,
+                tx_chain: unsafe { core::ptr::read(&mut this.tx_chain) },
+                cfg: unsafe { core::ptr::read(&mut this.cfg) },
+            }
         }
     }
 
@@ -332,15 +452,15 @@ pub mod continuous_dma {
             &mut self,
             freq_hz: u32,
             is_alternate: bool,
-        ) -> Result<(), Error> {
-            // This is a no_std port of the relevant parts of:
-            // - dac_dma_periph_init()
-            // - s_dac_dma_periph_set_clock()
+        ) -> Result<(), ConfigError> {
+            // This is a no_std port of the relevant parts of ESP-IDF:
+            // - dac_dma_periph_init(): https://github.com/espressif/esp-idf/blob/b9a308a47ca4128d018495662b009a7c461b6780/components/esp_driver_dac/esp32s2/dac_dma.c#L86-L169
+            // - s_dac_dma_periph_set_clock(): https://github.com/espressif/esp-idf/blob/b9a308a47ca4128d018495662b009a7c461b6780/components/esp_driver_dac/esp32s2/dac_dma.c#L115-L167
             //
             // We use APB clock only for now (clk_sel = 2).
 
             if freq_hz == 0 {
-                return Err(Error::UnsupportedFrequency);
+                return Err(ConfigError::UnsupportedFrequency);
             }
 
             let apb_hz = crate::clock::Clocks::get().apb_clock.as_hz() as u32;
@@ -348,7 +468,7 @@ pub mod continuous_dma {
 
             let total_div = apb_hz / trans_freq_hz;
             if total_div < 2 {
-                return Err(Error::UnsupportedFrequency);
+                return Err(ConfigError::UnsupportedFrequency);
             }
 
             let interval: u32 = if total_div < 256 {
@@ -360,12 +480,12 @@ pub mod continuous_dma {
             };
 
             if interval.saturating_mul(256) <= total_div {
-                return Err(Error::UnsupportedFrequency);
+                return Err(ConfigError::UnsupportedFrequency);
             }
 
             let src_freq_hz = apb_hz / interval;
             let div = calc_clk_div_frac_accurate(src_freq_hz, trans_freq_hz, 1, 257, 64)
-                .ok_or(Error::UnsupportedFrequency)?;
+                .ok_or(ConfigError::UnsupportedFrequency)?;
 
             // Program clock:
             // adc_ll_digi_controller_clk_div(div.integer - 1, div.denominator, div.numerator)
@@ -461,6 +581,7 @@ pub mod continuous_dma {
         /// Continuously write to the DAC using a circular DMA buffer.
         ///
         /// The returned transfer handle provides `available()`/`push_with()` for refilling.
+        #[instability::unstable]
         pub fn write_dma_circular<'t>(
             &'t mut self,
             words: &'t impl ReadBuffer,
@@ -473,6 +594,7 @@ pub mod continuous_dma {
         }
 
         /// Write a single-shot DMA buffer (acyclic).
+        #[instability::unstable]
         pub fn write_dma<'t>(
             &'t mut self,
             words: &'t impl ReadBuffer,
@@ -482,6 +604,14 @@ pub mod continuous_dma {
         {
             self.start_tx_transfer(words, false)?;
             Ok(DmaTransferTx::new(self))
+        }
+
+        /// Apply a new configuration to the DAC digital controller.
+        #[instability::unstable]
+        pub fn apply_config(&mut self, config: &Config) -> Result<(), ConfigError> {
+            self.configure_clock_and_enable_dma(config.freq_hz, false)?;
+            self.cfg = *config;
+            Ok(())
         }
     }
 
@@ -503,6 +633,17 @@ pub mod continuous_dma {
             self.tx_channel.stop_transfer();
 
             // Optionally disconnect DMA path (keeps DAC powered):
+            Self::dac_digi_enable_dma(false);
+        }
+    }
+
+    impl<Dm> Drop for DacContinuousTx<'_, Dm>
+    where
+        Dm: DriverMode,
+    {
+        fn drop(&mut self) {
+            Self::dac_digi_trigger_output(false);
+            self.tx_channel.stop_transfer();
             Self::dac_digi_enable_dma(false);
         }
     }
