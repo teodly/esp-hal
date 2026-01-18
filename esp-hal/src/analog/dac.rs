@@ -52,8 +52,8 @@ pub mod continuous_dma {
     //! ## Hardware notes (ESP32-S2)
     //! - The DAC “continuous” engine is driven by the APB_SARADC digital controller.
     //! - The data source for DAC DMA is SPI3 DMA TX (no SPI pins involved).
-    //! - The DAC digital controller shares clocking/dividers with the ADC digital controller.
-    //!   This is typically compatible with ADC *oneshot* reads, but may interfere with ADC
+    //! - The DAC digital controller shares clocking/dividers with the ADC digital controller. This
+    //!   is typically compatible with ADC *oneshot* reads, but may interfere with ADC
     //!   digital/continuous modes.
     //!
     //! ## Current API surface
@@ -67,12 +67,25 @@ pub mod continuous_dma {
     use enumset::EnumSet;
 
     use crate::{
-        Blocking, DriverMode,
+        Blocking,
+        DriverMode,
         analog::dac::Dac,
         dma::{
-            Channel, ChannelTx, DescriptorChain, DmaChannelFor, DmaDescriptor, DmaError,
-            DmaPeripheral, DmaTransferTx, DmaTransferTxCircular, DmaTxInterrupt, InterruptAccess,
-            PeripheralTxChannel, ReadBuffer, RegisterAccess, TxRegisterAccess,
+            Channel,
+            ChannelTx,
+            DescriptorChain,
+            DmaChannelFor,
+            DmaDescriptor,
+            DmaError,
+            DmaPeripheral,
+            DmaTransferTx,
+            DmaTransferTxCircular,
+            DmaTxInterrupt,
+            InterruptAccess,
+            PeripheralTxChannel,
+            ReadBuffer,
+            RegisterAccess,
+            TxRegisterAccess,
             dma_private::{DmaSupport, DmaSupportTx},
         },
         peripherals::{APB_SARADC, DAC1, GPIO17, SENS, SPI3},
@@ -228,8 +241,9 @@ pub mod continuous_dma {
             let channel = Channel::new(dma.degrade());
             channel.runtime_ensure_compatible(&spi3);
 
-            // Keep SPI3 peripheral clock enabled for as long as the DAC continuous DMA driver lives.
-            // On ESP32-S2 the DAC DMA backend uses SPI3 DMA registers (and SPI bus clocking matters).
+            // Keep SPI3 peripheral clock enabled for as long as the DAC continuous DMA driver
+            // lives. On ESP32-S2 the DAC DMA backend uses SPI3 DMA registers (and SPI
+            // bus clocking matters).
             let spi3_guard = PeripheralGuard::new(Peripheral::Spi3);
 
             // NOTE: We keep SPI3 token to prevent other users from touching it.
@@ -405,8 +419,9 @@ pub mod continuous_dma {
             self.tx_channel
                 .listen_out(EnumSet::only(DmaTxInterrupt::Eof));
 
-            // Prepare SPI3 DMA outlink manually (avoid auto-write-back, which SPI DMA doesn't support)
-            // This mirrors `ChannelTx::do_prepare()` but forces `auto_write_back = false`.
+            // Prepare SPI3 DMA outlink manually (avoid auto-write-back, which SPI DMA doesn't
+            // support) This mirrors `ChannelTx::do_prepare()` but forces
+            // `auto_write_back = false`.
             self.tx_channel
                 .tx_impl
                 .set_burst_mode(crate::dma::BurstConfig::default());
