@@ -92,29 +92,15 @@ pub mod continuous_dma {
     use enumset::EnumSet;
 
     use crate::{
-        Async,
-        Blocking,
-        DriverMode,
+        Async, Blocking, DriverMode,
         analog::dac::Dac,
         dma::{
-            Channel,
-            ChannelTx,
-            DescriptorChain,
-            DmaChannelFor,
-            DmaDescriptor,
-            DmaError,
-            DmaPeripheral,
-            DmaTransferTx,
-            DmaTransferTxCircular,
-            DmaTxInterrupt,
-            InterruptAccess,
-            PeripheralTxChannel,
-            ReadBuffer,
-            RegisterAccess,
-            TxRegisterAccess,
+            Channel, ChannelTx, DescriptorChain, DmaChannelFor, DmaDescriptor, DmaError,
+            DmaPeripheral, DmaTransferTx, DmaTransferTxCircular, DmaTxInterrupt, InterruptAccess,
+            PeripheralTxChannel, ReadBuffer, RegisterAccess, TxRegisterAccess,
             dma_private::{DmaSupport, DmaSupportTx},
         },
-        peripherals::{APB_SARADC, DAC1, GPIO17, SENS, SPI3},
+        peripherals::{APB_SARADC, DAC1, DAC2, GPIO17, GPIO18, SENS, SPI3},
         system::{Peripheral, PeripheralGuard},
     };
 
@@ -152,17 +138,61 @@ pub mod continuous_dma {
     pub enum ConfigError {
         /// The requested frequency cannot be represented with the available dividers.
         UnsupportedFrequency,
+
+        /// [`ChannelMode::Alternate`] requires enabling DAC2 so each channel receives samples.
+        ChannelModeRequiresDac2,
+
+        /// Backwards-compatible alias for [`ConfigError::ChannelModeRequiresDac2`].
+        #[doc(hidden)]
+        MissingSecondChannel,
     }
 
     impl core::fmt::Display for ConfigError {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             match self {
                 ConfigError::UnsupportedFrequency => write!(f, "unsupported frequency"),
+                ConfigError::ChannelModeRequiresDac2 | ConfigError::MissingSecondChannel => {
+                    write!(f, "alternate mode requires DAC2 to be enabled")
+                }
             }
         }
     }
 
     impl core::error::Error for ConfigError {}
+
+    /// Channel mode for the continuous DAC engine.
+    ///
+    /// On ESP32-S2 the DAC digital controller supports either:
+    /// - [`ChannelMode::Mono`]: DAC1 only (GPIO17).
+    /// - [`ChannelMode::Simultaneous`]: DAC1 and DAC2 output the same samples (if DAC2 is enabled).
+    /// - [`ChannelMode::Alternate`]: the DMA stream is interleaved between DAC1 and DAC2.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    #[non_exhaustive]
+    #[instability::unstable]
+    pub enum ChannelMode {
+        /// Use DAC1 only (GPIO17).
+        Mono,
+
+        /// Both DAC channels (if enabled) output the same samples.
+        Simultaneous,
+
+        /// Samples are interleaved between DAC1 and DAC2.
+        ///
+        /// For example, given a DMA stream `A B C D ...`:
+        /// - DAC1 outputs: `A C ...`
+        /// - DAC2 outputs: `B D ...`
+        ///
+        /// Note: this is not perfectly simultaneous; channels are offset by one DAC tick.
+        Alternate,
+    }
+
+    impl ChannelMode {
+        #[inline(always)]
+        fn is_alternate(self) -> bool {
+            matches!(self, ChannelMode::Alternate)
+        }
+    }
 
     /// Configuration for DAC continuous output.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, procmacros::BuilderLite)]
@@ -170,10 +200,18 @@ pub mod continuous_dma {
     #[non_exhaustive]
     #[instability::unstable]
     pub struct Config {
-        /// DAC conversion frequency in Hz (bytes/s for mono).
+        /// DAC conversion frequency in Hz of the *DMA byte stream* (controller trigger frequency).
+        ///
+        /// - In [`ChannelMode::Mono`], DAC1 consumes every byte, so the per-channel rate is `freq_hz`.
+        /// - In [`ChannelMode::Alternate`], DAC1 consumes even indices and DAC2 consumes odd indices,
+        ///   so each channel runs at `freq_hz / 2`.
         freq_hz: u32,
+
         /// Whether to invert the DAC digital controller clock.
         invert_clock: bool,
+
+        /// How the DMA byte stream is mapped to DAC channels.
+        channel_mode: ChannelMode,
     }
 
     impl Default for Config {
@@ -181,6 +219,7 @@ pub mod continuous_dma {
             Self {
                 freq_hz: 48_000,
                 invert_clock: true,
+                channel_mode: ChannelMode::Simultaneous,
             }
         }
     }
@@ -188,15 +227,20 @@ pub mod continuous_dma {
     impl Config {
         /// Create a new configuration for mono continuous DAC output.
         ///
-        /// `freq_hz` is the DAC conversion frequency (i.e. bytes/s for mono).
+        /// `freq_hz` is the per-channel DAC conversion frequency (samples/s per DAC channel).
         #[instability::unstable]
         pub const fn new(freq_hz: u32) -> Self {
             Self {
                 freq_hz,
                 invert_clock: true, // matches IDF default behavior for ESP32-S2
+                channel_mode: ChannelMode::Simultaneous,
             }
         }
     }
+
+    // NOTE: A helper for “balanced” output (e.g. inverting odd indices in the interleaved DMA
+    // stream) is intentionally not provided here. The correct transformation depends on how the
+    // application generates its samples and how the analog stage is wired.
 
     #[derive(Clone, Copy)]
     struct ClkDiv {
@@ -277,6 +321,7 @@ pub mod continuous_dma {
         Dm: DriverMode,
     {
         _dac: Dac<'d, DAC1<'d>>,
+        _dac2: Option<Dac<'d, DAC2<'d>>>,
         _spi3_guard: PeripheralGuard,
         _spi3: SPI3<'d>,
         tx_channel: ChannelTx<Dm, PeripheralTxChannel<SPI3<'d>>>,
@@ -320,6 +365,10 @@ pub mod continuous_dma {
             cfg: Config,
             descriptors: &'static mut [DmaDescriptor],
         ) -> Result<Self, ConfigError> {
+            if matches!(cfg.channel_mode, ChannelMode::Alternate) {
+                return Err(ConfigError::ChannelModeRequiresDac2);
+            }
+
             let _dac = Dac::new(dac1, dac1_pin);
 
             // Ensure DAC is in "pad source" mode (disable CW generator path for this channel).
@@ -336,9 +385,9 @@ pub mod continuous_dma {
 
             // NOTE: We keep SPI3 token to prevent other users from touching it.
             // We only use SPI3 as a DMA data source for the DAC controller.
-
             let mut this = Self {
                 _dac,
+                _dac2: None,
                 _spi3_guard: spi3_guard,
                 _spi3: spi3,
                 tx_channel: channel.tx,
@@ -346,7 +395,66 @@ pub mod continuous_dma {
                 cfg,
             };
 
-            this.configure_clock_and_enable_dma(cfg.freq_hz, false)?;
+            // Mono: no need to double the transfer frequency.
+            this.configure_clock_and_enable_dma(this.cfg.freq_hz, false)?;
+            Ok(this)
+        }
+
+        /// Create a dual-DAC continuous output driver.
+        ///
+        /// DAC1 is hard-wired to GPIO17 and DAC2 is hard-wired to GPIO18 on ESP32-S2.
+        ///
+        /// This constructor supports both:
+        /// - [`ChannelMode::Simultaneous`]: both channels (if enabled) output the same values, and
+        /// - [`ChannelMode::Alternate`]: the DMA byte stream is time-interleaved between DAC1 and DAC2.
+        ///
+        /// ### Alternate-mode mapping (interleaved stream)
+        /// When `cfg.channel_mode == ChannelMode::Alternate`, the DMA buffer is interpreted as:
+        /// - DAC1 outputs: `buf[0], buf[2], buf[4], ...`
+        /// - DAC2 outputs: `buf[1], buf[3], buf[5], ...`
+        ///
+        /// If your goal is “balanced” / noise-reducing output and you want the specific pattern:
+        /// `[s0, inv(s1), s2, inv(s3), ...]`,
+        /// then generate that interleaving/inversion pattern directly when filling the DMA buffer.
+        #[instability::unstable]
+        pub fn new_dual(
+            dac1: DAC1<'d>,
+            dac1_pin: GPIO17<'d>,
+            dac2: DAC2<'d>,
+            dac2_pin: GPIO18<'d>,
+            spi3: SPI3<'d>,
+            dma: impl DmaChannelFor<SPI3<'d>>,
+            cfg: Config,
+            descriptors: &'static mut [DmaDescriptor],
+        ) -> Result<Self, ConfigError> {
+            let _dac = Dac::new(dac1, dac1_pin);
+            let _dac2 = Some(Dac::new(dac2, dac2_pin));
+
+            // Ensure DAC is in "pad source" mode (disable CW generator path for these channels).
+            <DAC1<'d> as super::Instance>::set_pad_source();
+            <DAC2<'d> as super::Instance>::set_pad_source();
+
+            // Ensure the DMA channel matches the peripheral
+            let channel = Channel::new(dma.degrade());
+            channel.runtime_ensure_compatible(&spi3);
+
+            // Keep SPI3 peripheral clock enabled for as long as the DAC continuous DMA driver
+            // lives. On ESP32-S2 the DAC DMA backend uses SPI3 DMA registers (and SPI
+            // bus clocking matters).
+            let spi3_guard = PeripheralGuard::new(Peripheral::Spi3);
+
+            let mut this = Self {
+                _dac,
+                _dac2,
+                _spi3_guard: spi3_guard,
+                _spi3: spi3,
+                tx_channel: channel.tx,
+                tx_chain: DescriptorChain::new(descriptors),
+                cfg,
+            };
+
+            let is_alternate = matches!(this.cfg.channel_mode, ChannelMode::Alternate);
+            this.configure_clock_and_enable_dma(this.cfg.freq_hz, is_alternate)?;
             Ok(this)
         }
 
@@ -357,6 +465,7 @@ pub mod continuous_dma {
             let tx_channel = unsafe { core::ptr::read(&mut this.tx_channel) }.into_async();
             DacContinuousTx {
                 _dac: unsafe { core::ptr::read(&mut this._dac) },
+                _dac2: unsafe { core::ptr::read(&mut this._dac2) },
                 _spi3_guard: unsafe { core::ptr::read(&mut this._spi3_guard) },
                 _spi3: unsafe { core::ptr::read(&mut this._spi3) },
                 tx_channel,
@@ -374,6 +483,7 @@ pub mod continuous_dma {
             let tx_channel = unsafe { core::ptr::read(&mut this.tx_channel) }.into_blocking();
             DacContinuousTx {
                 _dac: unsafe { core::ptr::read(&mut this._dac) },
+                _dac2: unsafe { core::ptr::read(&mut this._dac2) },
                 _spi3_guard: unsafe { core::ptr::read(&mut this._spi3_guard) },
                 _spi3: unsafe { core::ptr::read(&mut this._spi3) },
                 tx_channel,
@@ -464,7 +574,10 @@ pub mod continuous_dma {
             }
 
             let apb_hz = crate::clock::Clocks::get().apb_clock.as_hz() as u32;
-            let trans_freq_hz = freq_hz.saturating_mul(if is_alternate { 2 } else { 1 });
+            // In alternate mode the stream is interleaved between DAC1/DAC2, so each channel will
+            // effectively run at half of `freq_hz`. We intentionally do NOT double the stream rate
+            // here.
+            let trans_freq_hz = freq_hz;
 
             let total_div = apb_hz / trans_freq_hz;
             if total_div < 2 {
@@ -609,7 +722,14 @@ pub mod continuous_dma {
         /// Apply a new configuration to the DAC digital controller.
         #[instability::unstable]
         pub fn apply_config(&mut self, config: &Config) -> Result<(), ConfigError> {
-            self.configure_clock_and_enable_dma(config.freq_hz, false)?;
+            if config.channel_mode.is_alternate() && self._dac2.is_none() {
+                return Err(ConfigError::MissingSecondChannel);
+            }
+
+            self.configure_clock_and_enable_dma(
+                config.freq_hz,
+                config.channel_mode.is_alternate(),
+            )?;
             self.cfg = *config;
             Ok(())
         }
